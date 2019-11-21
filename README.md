@@ -1,3 +1,4 @@
+
 # SIM5 - a general purpose library for GR raytracing and radiation transport
 
 ## Introduction
@@ -11,8 +12,9 @@ The library contains
 * an implementation of relativistic thin disk model
 * basic routines related to GR and Kerr geometry in particular
 * routines for computing null geodesics and GR raytracing with polarization 
+* routines to preform simple radiative transfer calculations in curved spacetimes
 
-The library is thread-safe and supports parallelization of the calculations at both CPUs (OpenMP/MPI) and GPUs (CUDA/OpenCL). 
+The library is thread-safe (with few marked exceptions) and supports parallelization of the calculations at both CPUs (OpenMP/MPI) and GPUs (CUDA/OpenCL). 
 
 ## Installation
 
@@ -123,8 +125,77 @@ import sim5
 Python calls to SIM5 routines are handled by the compiled C code in `lib/sim5lib.so` library. Although there is some overhead connected with the call to SIM5 routines, the actual evaluation of SIM5 functions is as fast as C code can be. This makes complex tasks (like raytracing) reasonably fast even if they are coded in Python (see examples in demo folder).
 
 ### Raytracing with SIM5
+Raytracing refers to a technique that constructs observed images, spectra or lightcurves of astrophysical sources taking into account relativistic effects on light propagation such as gravitational light bending or shifting of energies. Fundamentally, there are two approaches in the integration of light coming to an observer's detector: 
+* integration on the observer side over the local sky  
+  ![equation of photon motion](https://latex.codecogs.com/svg.latex?F_%5Cnu%5E%7B%5Crm%20obs%7D%28E%29%20%3D%20%5Cint_%5COmega%20I_%5Cnu%5E%7B%5Crm%20loc%7D%28E%2Fg%29%5C%2C%20g%5E3%20%5C%2C%20d%5COmega)  
+* integration on the source side over the surface of the radiating body  
+ ![equation of photon motion](https://latex.codecogs.com/svg.latex?F_%5Cnu%5E%7B%5Crm%20obs%7D%28E%29%20%3D%20%5Cfrac%7B1%7D%7BD%5E2%7D%5Cint_S%20I_%5Cnu%5E%7B%5Crm%20loc%7D%28E%2Fg%29%5C%2C%20g%5E3%20%5C%2C%5Cfrac%7BdS_f%7D%7BdS_%5Cperp%7D%5C%2C%5Cfrac%7BdS_%5Cperp%7D%7BdS%7D%5C%2C%20dS)
 
-tbd
+Integration at the observer side over its local sky is in most cases both easier and more efficient, on the other hand it requires a stationary spacetime metric (that does not change in time). Integration over the surface of the radiating body is almost always limitted to simple geometical setups, e.g. an equatorial plane disk.
+
+SIM5 library adopts the observer side integration (though the other approach is also possible) and implements two numerical schemes of raytracing photons through curved spacetimes:
+* by evaluating positional elliptic integrals along a defined trajectory
+* by a stepwise integration of the [geodesic equation](https://en.wikipedia.org/wiki/Geodesics_in_general_relativity) for null geodesics
+
+Both approaches have their advatages and disadvantages and the choice of one or the other depends mainly on the specific task that has to be carried out. In general, the use of the stepwise integration of the geodesic equation is necessary when the spacetime is not described by Kerr metric, otherwise the required accuracy, performance and computational complexity have to be considered to make a choice.
+
+#### Raytracing by evaluating positional elliptic integrals
+
+In Kerr spacetime, photon motion in *r*-*&theta;* plane is governed by equation  
+![equation of photon motion](https://latex.codecogs.com/svg.latex?%5Cint%5E%7Br%7D%5Cfrac%7Bdr%7D%7B%5Csqrt%7BR%28r%29%7D%7D%3D%5Cint%5E%7B%5Ctheta%7D%5Cfrac%7Bd%5Ctheta%7D%7B%5Csqrt%7B%5CTheta%28%5Ctheta%29%7D%7D%2C)  
+where *R(r)* and *&Theta;(&theta;)* are polynomials, and a solution can be expressed in terms of [Jacobi elliptic functions](https://en.wikipedia.org/wiki/Jacobi_elliptic_functions). Any photon geodesic is determined by it two constants of motion (traditionally denoted *&lambda;* and *q*) and a position along the geodesic can be uniquely expressed using the value of the above positional integral. In this way, once the trajectory is fixed by its motion constants, it is possible to follow the photon path by changing the value of the positional integral and by inverting it to obtain spacetime coordinates:
+```C
+// initialize the geodesic with an initial position `x` and direction `k`
+geodesic_init_src(bh_spin, x[1], x[2], k, k[1]<0?1:0, &gd, &error);
+// get the initial value of the positional integral
+P = geodesic_P_int(&gd, x, 0);
+
+r = x[1];   // radial coordinate
+m = x[2];   // poloidal cordinate, m=cos(theta)
+while (r < R_MAX) {
+    // make a step along the geodesic; both `P`, `r` and `m` are updated
+    geodesic_follow(&gd, deltaP, &P, &r, &m, &status);   
+    if (!status) break;
+    ...	 // do some stuff at the new place
+}
+```
+
+Refer to the following examples:
+* [tbd]
+
+
+##### Equatorial plane
+An important special case of the above approach is raytracing of photons that originate from the equatorial plane, as this is a commonly adopted approximation e.g. in case of dealing with accretion disks. Integrating over the observer's sky, we can directly determine the radius from which the photons originate by an analytic inversion of an elliptic positional integral. Thus, by using
+```C
+geodesic_init_inf(inclination, spin, alpha, beta, &gd, &error);
+P = geodesic_find_midplane_crossing(&gd, 0);
+r = geodesic_position_rad(&gd, P);
+```
+one can quickly and efficiently find the original radius of a photon coming out of the disk surface that has  impact parameters *alpha* and *beta* on the observer's image plane.
+
+Refer to the following examples:
+* [Example 04](examples/04-disk-image-eqplane) - accretion disk image
+* [Example 05](examples/05-disk-spectrum-eqplane) - accretion disk spectrum
+
+#### Raytracing by stepwise geodesic equation integration
+Having an initial position *x<sup>&mu;</sup>* and direction of propagation *dx<sup>&mu;</sup>/d&lambda;* of the photon, its subsequent trajectory through the spacetime can be computed by solving a second-order ordinary differential equation (so called geodesic equation):  
+![geodesic equation](https://latex.codecogs.com/svg.latex?%5Ccfrac%7Bd%5E2&space;x%5E%5Cmu%7D%7Bd%5Clambda%5E2%7D&space;=&space;-%5CGamma%5E%5Cmu_%7B%5Calpha%5Cbeta%7D%5Cbig%28x%5E%5Cmu%5Cbig%29%5C,%5Ccfrac%7Bdx%5E%5Calpha%7D%7Bd%5Clambda%7D&space;%5C,&space;%5Ccfrac%7Bdx%5E%5Cbeta%7D%7Bd%5Clambda%7D)  
+SIM5 uses [Verlet integration](https://en.wikipedia.org/wiki/Verlet_integration) method to numericaly integrate geodesic equations because it offers good performance while keeping reasonable precission (see [Dolence at al. 2009](http://dx.doi.org/10.1088/0067-0049/184/2/387)). The basic scheme of the integration is the following (in Python):
+```python
+# initialize trajectory from initial position `x` and direction `k`
+sim5.raytrace_prepare(bh_spin, x, k, 1.0, rtd)
+# raytracing loop
+while (True):
+    dl.assign(1e-2)                    # set target step for affine parameter
+    sim5.raytrace(x, k, dl, rtd)       # advance along photon trajectory
+    if (rtd.error > 0.1): break        # check precission
+    if (x[1] > MAX_DISTANCE): break    # check for terminating condition
+#end of while
+```
+
+Refer to the following examples:
+* [Example 04](examples/04) - accretion disk image - equatorial plane
+
 
 ### Code parallelization
 
@@ -146,4 +217,3 @@ If you have used SIM5 in your code or used a code that itself is using SIM5, ple
 ## License
 
 SIM5 is released under the MIT License.
-
